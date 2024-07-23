@@ -40,55 +40,105 @@ driver_download_urls = {
 }
 
 class ClientToProxy(Thread):
-    def __init__(self, host, port):
+    def __init__(self, browser_socket : socket.socket, inet_socket : socket.socket):
         super(ClientToProxy, self).__init__()
-        self.web = None
-        self.port = port
-        self.host = host
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((host, port))
-        self.sock.listen(1)
+        self.browser_socket = browser_socket
+        self.inet_socket = inet_socket
         
     def run(self):
-        while True:
-            self.client, addr = self.sock.accept()
-            data = self.client.recv(4096)
-            if data:
-                print(f"CLIENT: {data[:100]}")
-                self.web.sendall(data)
+        try:
+            while True:
+                data = self.browser_socket.recv(4096)
+                if not data:
+                    break
+
+                self.inet_socket.sendall(data)
+        except Exception as e:
+            print(f"Browser connection error: {e}")
+        finally:
+            self.browser_socket.close()
+            self.inet_socket.close()
 
 class ProxyToWeb(Thread):
-    def __init__(self, host, port):
+    def __init__(self, inet_socket : socket.socket, browser_socket : socket.socket):
         super(ProxyToWeb, self).__init__()
-        self.client = None
-        self.port = port
-        self.host = host
-        self.web = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.web.connect((host, port))
+        self.inet_socket = inet_socket
+        self.browser_socket = browser_socket
 
     def run(self):
-        while True:
-            data = self.web.recv(4096)
-            if data:
-                self.client.sendall(data)
+        try:
+            while True:
+                data = self.inet_socket.recv(4096)
+                if not data:
+                    break
+
+                self.browser_socket.sendall(data)
+        except Exception as e:
+            print(f"Internet connection error: {e}")
+        finally:
+            self.inet_socket.close()
+            self.browser_socket.close()
 
 class CensorProxy(Thread):
-    def __init__(self, victim, website, port):
+    def __init__(self, victim, port):
         super(CensorProxy, self).__init__()
         self.victim = victim
-        self.website = website
         self.port = port
+
+    def getHostHeaderFromRequest(self, start_data : bytes):
+        print(start_data)
+        try:
+            headers = start_data.split(b"\r\n")
+            for header in headers:
+                if header.lower().find(b"host:") > -1:
+                    return header.decode().split(": ")[1]
+        except Exception as e:
+            print(f"Couldn't find host header: {e}")
+        return None
+    
+    def parseHostPort(self, host_header):
+        if ":" in host_header:
+            host, port = host_header.split(":")
+            return host, int(port)
+        return host_header, 80
 
     def run(self):
         while True:
-            self.c2p = ClientToProxy(self.victim, self.port)
-            self.p2w = ProxyToWeb(self.website, self.port)
-            self.c2p.web = self.p2w.web
-            self.p2w.client = self.c2p.client
+            browser_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            browser_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            browser_listen.bind((self.victim, self.port))
+            browser_listen.listen(10)
+            print("Proxy waiting for client connection...")
+            browser_socket, browser_addr = browser_listen.accept()
+            print(f"Client connected at {browser_addr}")
 
-            self.c2p.start()
-            self.p2w.start()
+            start_data = browser_socket.recv(4096)
+            host_header = self.getHostHeaderFromRequest(start_data)
+
+            if host_header:
+                host, port = self.parseHostPort(host_header)
+                print(f"Connecting to {host}:{port}")
+
+
+                try:
+                    inet_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    inet_socket.connect((host, port))
+
+                    inet_socket.sendall(start_data)
+
+                    c2p = ClientToProxy(browser_socket, inet_socket)
+                    p2i = ProxyToWeb(inet_socket, browser_socket)
+                    c2p.start()
+                    p2i.start()
+
+                    c2p.join()
+                    p2i.join()
+                except Exception as e:
+                    print(f"Error connecting to {host}:{port} : {e}")
+                    browser_socket.close()
+            else:
+                print("Invalid request error")
+                browser_socket.close()
 
 def installDriver():
     download_link = driver_download_urls[BROWSER]
@@ -234,6 +284,9 @@ def initializeSelenium():
         options.add_argument("-profile")
         options.add_argument(f"{install_path}/profiles/")
 
+    if BROWSER == "chrome":
+        options.add_argument("--remote-debugging-port=9222")
+
     try:
         driver = getattr(webdriver, BROWSER.capitalize())(service=service, options=options)
         print(f"Booting selenium using {BROWSER}...")
@@ -288,7 +341,7 @@ def checkWebsiteStatus():
 if __name__ == "__main__":
     setup()
 
-    master_proxy = CensorProxy("127.0.0.1", "google.com", int(HOST_PORT))
+    master_proxy = CensorProxy("127.0.0.1", int(HOST_PORT))
     master_proxy.start()
 
     initializeSelenium()
