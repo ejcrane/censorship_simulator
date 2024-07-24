@@ -102,43 +102,83 @@ class CensorProxy(Thread):
             return host, int(port)
         return host_header, 80
 
+    def newClient(self, browser_socket : socket.socket):
+        start_data = browser_socket.recv(4096)
+        if not start_data:
+            print("Error: no data from client")
+            browser_socket.close()
+            return
+        
+        #checks if a CONNECT message is sent
+        method_line = start_data.split(b"\r\n")[0].decode()
+        if method_line.startswith("CONNECT"):
+            self.newConnect(browser_socket, method_line)
+
+        host_header = self.getHostHeaderFromRequest(start_data)
+        if host_header:
+            host, port = self.parseHostPort(host_header)
+            print(f"Connecting to {host}:{port}")
+
+
+            try:
+                inet_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                inet_socket.connect((host, port))
+                print(f"Connected to {host}:{port}")
+
+                inet_socket.sendall(start_data)
+
+                c2p = ClientToProxy(browser_socket, inet_socket)
+                p2i = ProxyToWeb(inet_socket, browser_socket)
+                c2p.start()
+                p2i.start()
+
+                c2p.join()
+                p2i.join()
+            except Exception as e:
+                print(f"Error connecting to {host}:{port} : {e}")
+                browser_socket.close()
+        else:
+            print("Invalid request error")
+            browser_socket.close()
+
+    def newConnect(self, browser_socket, method_line):
+        try:
+            _, address, _ = method_line.split()
+            host, port = address.split(":")
+            port = int(port)
+
+            inet_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            inet_socket.connect((host, port))
+            print(f"Connected to {host}:{port} for HTTPS")
+
+            browser_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+
+            c2p = ClientToProxy(browser_socket, inet_socket)
+            p2i = ProxyToWeb(inet_socket, browser_socket)
+            c2p.start()
+            p2i.start()
+
+            c2p.join()
+            p2i.join()
+        except Exception as e:
+            print(f"Error in CONNECT method handling: {e}")
+            browser_socket.close()
+
+
     def run(self):
+        browser_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        browser_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        browser_listen.bind((self.victim, self.port))
+        browser_listen.listen(10)
+        print("Proxy waiting for client connection...")
+
         while True:
-            browser_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            browser_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            browser_listen.bind((self.victim, self.port))
-            browser_listen.listen(10)
-            print("Proxy waiting for client connection...")
             browser_socket, browser_addr = browser_listen.accept()
             print(f"Client connected at {browser_addr}")
+            Thread(target=self.newClient, args=(browser_socket,)).start()
 
-            start_data = browser_socket.recv(4096)
-            host_header = self.getHostHeaderFromRequest(start_data)
-
-            if host_header:
-                host, port = self.parseHostPort(host_header)
-                print(f"Connecting to {host}:{port}")
-
-
-                try:
-                    inet_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    inet_socket.connect((host, port))
-
-                    inet_socket.sendall(start_data)
-
-                    c2p = ClientToProxy(browser_socket, inet_socket)
-                    p2i = ProxyToWeb(inet_socket, browser_socket)
-                    c2p.start()
-                    p2i.start()
-
-                    c2p.join()
-                    p2i.join()
-                except Exception as e:
-                    print(f"Error connecting to {host}:{port} : {e}")
-                    browser_socket.close()
-            else:
-                print("Invalid request error")
-                browser_socket.close()
+            
+            
 
 def installDriver():
     download_link = driver_download_urls[BROWSER]
