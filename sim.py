@@ -5,7 +5,6 @@ import subprocess
 from selenium import webdriver
 from selenium.webdriver.firefox.service import Service as Fserv
 from selenium.webdriver.chrome.service import Service as Cserv
-import time
 from platform import system
 import os
 from threading import Thread
@@ -19,12 +18,13 @@ PROXY = f"{HOST_IP}:{HOST_PORT}"
 BROWSER = "firefox"
 
 country = None
-website = None
 install_path = None
 service_path = None
 binary_path = None
 driver = None
 browser_command = None
+visited_sites = dict()
+verbose = False
 
 headers = {
     "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
@@ -54,7 +54,8 @@ class ClientToProxy(Thread):
 
                 self.inet_socket.sendall(data)
         except Exception as e:
-            print(f"Browser connection error: {e}")
+            if verbose:
+                print(f"Browser connection error: {e}")
         finally:
             self.browser_socket.close()
             self.inet_socket.close()
@@ -74,7 +75,8 @@ class ProxyToWeb(Thread):
 
                 self.browser_socket.sendall(data)
         except Exception as e:
-            print(f"Internet connection error: {e}")
+            if verbose:
+                print(f"Internet connection error: {e}")
         finally:
             self.inet_socket.close()
             self.browser_socket.close()
@@ -86,14 +88,14 @@ class CensorProxy(Thread):
         self.port = port
 
     def getHostHeaderFromRequest(self, start_data : bytes):
-        print(start_data)
         try:
             headers = start_data.split(b"\r\n")
             for header in headers:
                 if header.lower().find(b"host:") > -1:
                     return header.decode().split(": ")[1]
         except Exception as e:
-            print(f"Couldn't find host header: {e}")
+            if verbose:
+                print(f"Couldn't find host header: {e}")
         return None
     
     def parseHostPort(self, host_header):
@@ -105,25 +107,41 @@ class CensorProxy(Thread):
     def newClient(self, browser_socket : socket.socket):
         start_data = browser_socket.recv(4096)
         if not start_data:
-            print("Error: no data from client")
+            if verbose:
+                print("Error: no data from client")
             browser_socket.close()
             return
-        
-        #checks if a CONNECT message is sent
-        method_line = start_data.split(b"\r\n")[0].decode()
-        if method_line.startswith("CONNECT"):
-            self.newConnect(browser_socket, method_line)
 
         host_header = self.getHostHeaderFromRequest(start_data)
         if host_header:
             host, port = self.parseHostPort(host_header)
-            print(f"Connecting to {host}:{port}")
-
+            if verbose:
+                print(f"[{host}:{port}] Checking if allowed...")
+            match checkWebsiteStatus(host):
+                case "OK":
+                    print(f"[{host}:{port}] OK")
+                case "Inconclusive":
+                    print(f"[{host}:{port}] Couldn't determine if blocked, passing through anyway")
+                case "ERROR":
+                    print(f"[{host}:{port}] API error! Restriction could not be verified")
+                case _:
+                    print(f"[{host}:{port}] BLOCKED!")
+                    browser_socket.close()
+                    return
+                
+            #checks if a CONNECT message is sent
+            method_line = start_data.split(b"\r\n")[0].decode()
+            if method_line.startswith("CONNECT"):
+                self.newConnect(browser_socket, method_line)
+            
+            if verbose:
+                print(f"[{host}:{port}] Connecting...")
 
             try:
                 inet_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 inet_socket.connect((host, port))
-                print(f"Connected to {host}:{port}")
+                if verbose:
+                    print(f"[{host}:{port}] Connected")
 
                 inet_socket.sendall(start_data)
 
@@ -135,10 +153,12 @@ class CensorProxy(Thread):
                 c2p.join()
                 p2i.join()
             except Exception as e:
-                print(f"Error connecting to {host}:{port} : {e}")
+                if verbose:
+                    print(f"[{host}:{port}] Error connecting: {e}")
                 browser_socket.close()
         else:
-            print("Invalid request error")
+            if verbose:
+                print("Invalid request error")
             browser_socket.close()
 
     def newConnect(self, browser_socket, method_line):
@@ -149,7 +169,8 @@ class CensorProxy(Thread):
 
             inet_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             inet_socket.connect((host, port))
-            print(f"Connected to {host}:{port} for HTTPS")
+            if verbose:
+                print(f"[{host}:{port}] Connected for HTTPS")
 
             browser_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
@@ -161,7 +182,8 @@ class CensorProxy(Thread):
             c2p.join()
             p2i.join()
         except Exception as e:
-            print(f"Error in CONNECT method handling: {e}")
+            if verbose:
+                print(f"Error in CONNECT method handling: {e}")
             browser_socket.close()
 
 
@@ -174,7 +196,8 @@ class CensorProxy(Thread):
 
         while True:
             browser_socket, browser_addr = browser_listen.accept()
-            print(f"Client connected at {browser_addr}")
+            if verbose:
+                print(f"Client connected at {browser_addr}")
             Thread(target=self.newClient, args=(browser_socket,)).start()
 
             
@@ -193,7 +216,7 @@ def installDriver():
         pass
 
     try:
-        subprocess.run(["wget", "-P", "drivers/", download_link])
+        subprocess.run(["wget", "-P", "drivers/", download_link, "-q", "--show-progress"])
     except:
         print("Error downloading, check internet connection")
         exit(1)
@@ -210,7 +233,7 @@ def installDriver():
             print("Removing chromedriver-linux64.zip")
             subprocess.run(["rm", f"{install_path}/drivers/chromedriver-linux64.zip"])
         case _:
-            print("This is a pretty bad error message to get")
+            print("This is a pretty bad error message to get.")
             exit(2)
 
 def loadDriver():
@@ -236,7 +259,6 @@ def loadDriver():
 
 def setup():
     global country
-    global website
     global browser_command
     global install_path
 
@@ -272,8 +294,6 @@ def setup():
         except:
             print("Invalid country, please try again")
     print(f"Your selected country is {country.name}")
-    website = input("Enter website: ")
-    print(f"Your selected website is {website}")
 
 def checkSnap(browser):
     try:
@@ -330,7 +350,6 @@ def initializeSelenium():
     try:
         driver = getattr(webdriver, BROWSER.capitalize())(service=service, options=options)
         print(f"Booting selenium using {BROWSER}...")
-        time.sleep(3)
     except Exception as e:
         print(f"Failed to initialize selenium: {e}")
 
@@ -341,9 +360,9 @@ def terminateSelenium():
     except:
         print("No webdriver to terminate!")
 
-def getOONIJSON(url):
+def getOONIJSON(website, url):
     params = {
-        "input": website,
+        "domain": website,
         "probe_cc": country.alpha_2,
         "limit": 10
     }
@@ -355,27 +374,37 @@ def getOONIJSON(url):
     data = response.json()
     return data
 
-def checkWebsiteStatus():
-    body = getOONIJSON(API_URL)
+def checkWebsiteStatus(website):
+    global visited_sites
+    if website in visited_sites.keys():
+        if visited_sites[website] != "Inconclusive":
+            return visited_sites[website]
 
-    some_records = body["results"]
-
-    if len(some_records) == 0:
+    try:
+        body = getOONIJSON(website, API_URL)
+        some_records = body["results"]
+    except:
         return "ERROR"
+    
+    if len(some_records) == 0:
+        return "Inconclusive"
     
     the_chosen_one = random.choice(some_records)
 
     while the_chosen_one["failure"]:
         some_records.remove(the_chosen_one)
         if len(some_records) == 0:
-            print("all failures!")
+            if verbose:
+                print("all failures!")
             return "ERROR"
 
         the_chosen_one = random.choice(some_records)
 
     if the_chosen_one["anomaly"]:
+        visited_sites[website] = the_chosen_one["scores"]["analysis"]["blocking_type"]
         return the_chosen_one["scores"]["analysis"]["blocking_type"]
     else:
+        visited_sites[website] = "OK"
         return "OK"
 
 if __name__ == "__main__":
